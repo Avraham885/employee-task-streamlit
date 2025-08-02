@@ -212,7 +212,7 @@ if submitted and uploaded_file:
     st.dataframe(df_assignments[["Day", "ShiftType", "AssignedTo"]])
     
     pivot_table = df_assignments.pivot(index="AssignedTo", columns="Day", values="ShiftType").fillna("")
-    st.subheader("📊 טבלת שיבוץ בפורמט סופי (לפי עובד ויום)")
+    st.subheader("📊 טבלת שיבוץ בפורמט סופי להדפסה")
     st.dataframe(pivot_table)
 
     st.subheader("💰 טבלת עלות כוללת לפי יום")
@@ -232,3 +232,4 @@ if submitted and uploaded_file:
         file_name="שיבוץ_עובדים.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
