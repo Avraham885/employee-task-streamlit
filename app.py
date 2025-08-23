@@ -1,523 +1,929 @@
 # -*- coding: utf-8 -*-
 """
-Assignment App (Hungarian Algorithm) — RTL v5
-- Dummy-preferred blocking: illegal pairs set to hard_constraint*10 to ensure "לא שובצו" מזוהה
-- Unassigned reasons are alias-aware ("לא נמצא <Alias> מתאים")
-- Hide index in all tables for readability
-- Prettify Taxi headers to Hebrew (Rating, Car_Type, Is_Silent, ...)
+Shift Scheduler — Hungarian (v7.8a)
+Base: v7.7i with bug fixes and per-day 'required' roles.
+Changes:
+1) Fix: added gini() to avoid NameError.
+2) NEW: Per-day required roles (e.g., Sunday morning "אחמש" חובה). UI stores per day; algorithm uses min-1 when required.
+   - Backward compatible: falls back to legacy per-shift REQUIRED_BY_SHIFT if per-day not set.
+3) Stronger file validation & normalization for Employees sheet (columns, dtypes).
+4) Control tab now shows dispersion (CV/Gini) as fairness KPIs.
+5) Share/print table respects required min staffing display ('לא שובץ' when empty).
+6) General hardening and small UX copy edits.
 """
 
-import io
-import time
-from typing import List, Dict, Optional, Tuple
 
+# ---- Hotfix guard: ensure effective_plan_for_day exists before any call ----
+try:
+    effective_plan_for_day  # type: ignore  # noqa: F821
+except Exception:
+    pass
+else:
+    _EPFD_ALREADY = True
+if not locals().get("_EPFD_ALREADY", False):
+    from typing import Dict
+
+# --- Effective plan resolver (custom overrides defaults + business days) ---
+from typing import Dict
+def effective_plan_for_day(day_code: str) -> Dict[str, Dict[str,int]]:
+    custom = WEEK_PLAN.get(day_code, {}) if 'WEEK_PLAN' in globals() else {}
+    if custom:
+        return custom
+    # Respect business days config (default Sun-Fri); if day is not active and no custom plan -> no schedule
+    biz = st.session_state.get("CONFIG", {}).get("business_days", ["Sun","Mon","Tue","Wed","Thu","Fri"])
+    if day_code not in biz:
+        return {}
+    eff: Dict[str, Dict[str,int]] = {}
+    for s in SHIFTS:
+        base = DEFAULT_STAFFING.get(s, {}) if 'DEFAULT_STAFFING' in globals() else {}
+        has_demand = any(int(base.get(r, 0)) > 0 for r in ROLES)
+        has_required = any(bool(REQUIRED_BY_SHIFT.get(s, {}).get(r, False)) for r in ROLES) if 'REQUIRED_BY_SHIFT' in globals() else False
+        if has_demand or has_required:
+            eff[s] = {r: int(base.get(r, 0)) for r in ROLES}
+    return eff
+# --- End ---
+
+
+def effective_plan_for_day(day_code: str) -> Dict[str, Dict[str,int]]:  # fallback (minimal)
+        custom = WEEK_PLAN.get(day_code, {}) if 'WEEK_PLAN' in globals() else {}
+        if custom:
+            return custom
+        eff: Dict[str, Dict[str,int]] = {}
+        for s in SHIFTS if 'SHIFTS' in globals() else []:
+            base = DEFAULT_STAFFING.get(s, {}) if 'DEFAULT_STAFFING' in globals() else {}
+            has_demand = any(int(base.get(r, 0)) > 0 for r in (ROLES if 'ROLES' in globals() else []))
+            has_required = any(bool(REQUIRED_BY_SHIFT.get(s, {}).get(r, False)) for r in (ROLES if 'ROLES' in globals() else [])) if 'REQUIRED_BY_SHIFT' in globals() else False
+            if has_demand or has_required:
+                eff[s] = {r: int(base.get(r, 0)) for r in (ROLES if 'ROLES' in globals() else [])}
+        _EPFD_ALREADY = True
+        return eff
+# ---------------------------------------------------------------------------
+import io
+from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy.optimize import linear_sum_assignment
-import plotly.express as px
 
-DEFAULT_HARD_CONSTRAINT = 1_000_000.0
+# ----------------- Constants & Layout -----------------
+HARD_CONSTRAINT = 1_000_000.0
+HARD_BLOCK = HARD_CONSTRAINT * 10.0
 
-def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+DAYS_ORDER = [
+    ("Sun", "ראשון"),
+    ("Mon", "שני"),
+    ("Tue", "שלישי"),
+    ("Wed", "רביעי"),
+    ("Thu", "חמישי"),
+    ("Fri", "שישי"),
+    ("Sat", "שבת"),
+]
+
+st.set_page_config(page_title="🗓️ שיבוץ משמרות — v7.8a", layout="wide")
+
+def rtl_css():
+    st.markdown("""
+    <style>
+    html, body, [data-testid="stAppViewContainer"] * { direction: rtl; text-align: right; }
+    [data-testid="stSidebar"]{display:none;}
+    .chipline{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid #e5e7eb;border-radius:16px;background:#f6f8ff;}
+    .badge { display:inline-block; padding:6px 10px; border-radius:12px; background:#f0f2f6; margin-left:6px; }
+    .badge.ok { background:#e6ffed; }
+    .badge.warn { background:#fff5e6; }
+    .hsep{height:1px;background:#eee;margin:8px 0;}
+    </style>
+    """, unsafe_allow_html=True)
+
+rtl_css()
+
+st.title("🗓️ שיבוץ משמרות לבתי קפה ומסעדות ")
+st.caption("תפקידים/משמרות בהתאמה אישית, תכנית שבועית דינמית, איזון הוגן ותצוגות תוצאות עשירות — עם תמיכה ב'חובה' לפי יום.")
+
+def ss_get(k, default):
+    if k not in st.session_state: st.session_state[k] = default
+    return st.session_state[k]
+
+# ----------------- Session Structures -----------------
+ROLES: List[str] = ss_get("ROLES", [])                 # user-defined, start empty
+SHIFTS: List[str] = ss_get("SHIFTS", [])               # user-defined, start empty
+# Legacy global requirement: {shift: {role: bool}} (kept for backward compatibility / defaults)
+REQUIRED_BY_SHIFT: Dict[str, Dict[str, bool]] = ss_get("REQ_BY_SHIFT", {})
+# NEW per-day requirement: {day_code: {shift: {role: bool}}}
+REQUIRED_BY_DAY: Dict[str, Dict[str, Dict[str,bool]]] = ss_get("REQ_BY_DAY", {code:{} for code,_ in DAYS_ORDER})
+# Default staffing per shift: {shift: {role: qty}} used as initial suggestion
+DEFAULT_STAFFING: Dict[str, Dict[str,int]] = ss_get("DEFAULT_STAFFING", {})
+# Week plan: {day_code: {shift: {role: qty}}} only for active shifts
+WEEK_PLAN: Dict[str, Dict[str, Dict[str,int]]] = ss_get("WEEK_PLAN", {code:{} for code,_ in DAYS_ORDER})
+CONFIG: Dict = ss_get("CONFIG", {"shift_hours":8.0, "fairness":"ללא חלוקה הוגנת", "max_override":None})
+EMP_BYTES = st.session_state.get("EMP_FILE_BYTES")
+
+tabs = st.tabs(["הגדרות", "תוצאות", "לא שובצו", "בקרה", "שיתוף"])
+
+# ----------------- Utils -----------------
+def parse_csv_like(val) -> List[str]:
+    if pd.isna(val): return []
+    if not isinstance(val, str): val = str(val)
+    parts = [p.strip() for p in val.replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+# --- Added: Hebrew-to-English day mapping & normalizer ---
+HE2EN_DAYS = {
+    "ראשון": "Sun", "שני": "Mon", "שלישי": "Tue",
+    "רביעי": "Wed", "חמישי": "Thu", "שישי": "Fri", "שבת": "Sat",
+    # Accept also short Hebrew variants if appear
+    "א'": "Sun", "ב'": "Mon", "ג'": "Tue", "ד'": "Wed", "ה'": "Thu", "ו'": "Fri", "שבתון": "Sat"
+}
+
+def normalize_days_tokens(tokens):
+    out = []
+    for t in tokens:
+        t = str(t).strip()
+        out.append(HE2EN_DAYS.get(t, t))
+    return out
+# --- End Added ---
+
+
+def gini(x: np.ndarray) -> float:
+    """Gini coefficient for non-negative array x; returns 0 if empty or all zeros."""
+    if x is None: return 0.0
+    x = np.asarray(x, dtype=float).flatten()
+    if x.size == 0: return 0.0
+    if np.allclose(x, 0): return 0.0
+    if np.any(x < 0):  # shift to non-negative
+        x = x - np.min(x)
+    x_sorted = np.sort(x)
+    n = x_sorted.size
+    cumx = np.cumsum(x_sorted)
+    # Relative mean absolute difference method
+    g = (n + 1 - 2 * np.sum(cumx) / cumx[-1]) / n
+    return float(g)
+
+@st.cache_data(show_spinner=False)
+def read_excel_sheet(xbytes: bytes, sheet_name: str) -> pd.DataFrame:
+    with io.BytesIO(xbytes) as bio:
+        df = pd.read_excel(bio, sheet_name=sheet_name)
     df = df.copy()
     df.columns = [str(c).strip().replace(" ", "_") for c in df.columns]
     return df
 
-@st.cache_data(show_spinner=False)
-def load_excel_sheet_from_bytes(xlsx_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    with io.BytesIO(xlsx_bytes) as bio:
-        df = pd.read_excel(bio, sheet_name=sheet_name)
-    return clean_column_names(df)
-
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-def vectorized_distance_cost(df_rows: pd.DataFrame, df_cols: pd.DataFrame) -> Optional[np.ndarray]:
-    if not all(col in df_rows.columns for col in ["Location_X", "Location_Y"]):
-        return None
-    if not all(col in df_cols.columns for col in ["Location_X", "Location_Y"]):
-        return None
+def validate_employees_df(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """Validate Employees sheet schema and normalize key columns."""
+    required = ["ID", "Name", "HourlyCost", "DaysAvailable"]
+    optional = ["ShiftTypesAvailable", "RolesQualified", "Role", "MaxShiftsPerWeek"]
+    missing = [c for c in required if c not in df.columns]
+    errs = []
+    if missing:
+        errs.append(f"עמודות חסרות: {', '.join(missing)}")
+    # Normalize dtypes
     try:
-        A = df_rows[["Location_X", "Location_Y"]].to_numpy(dtype=float)
-        B = df_cols[["Location_X", "Location_Y"]].to_numpy(dtype=float)
-    except Exception:
-        return None
-    dists = np.sqrt(((A[:, None, :] - B[None, :, :]) ** 2).sum(axis=2))
-    return dists
+        if "ID" in df.columns:
+            df["ID"] = df["ID"].astype(str).str.strip()
+        if "Name" in df.columns:
+            df["Name"] = df["Name"].astype(str).str.strip()
+        if "HourlyCost" in df.columns:
+            df["HourlyCost"] = pd.to_numeric(df["HourlyCost"], errors="coerce").fillna(0.0).astype(float)
+        if "MaxShiftsPerWeek" in df.columns:
+            df["MaxShiftsPerWeek"] = pd.to_numeric(df["MaxShiftsPerWeek"], errors="coerce")
+    except Exception as e:
+        errs.append(f"שגיאת המרה/נירמול: {e}")
+    # Hints
+    hints = []
+    if "ShiftTypesAvailable" not in df.columns:
+        hints.append("מומלץ לכלול ShiftTypesAvailable כדי להגביל משמרות (התאמה לשמות המשמרות שהוגדרו).")
+    if "RolesQualified" not in df.columns and "Role" not in df.columns:
+        hints.append("מומלץ לכלול RolesQualified או Role כדי לקבוע כשירות לתפקידים.")
+    if hints:
+        st.info("המלצות סכימה: " + " ".join(hints))
+    ok = (len(errs) == 0) and (len(missing) == 0)
+    return ok, errs
 
-def _hebrew_header_map(alias_rows: str, alias_cols: str) -> Dict[str, str]:
-    base = {
-        "Rating": "דירוג",
-        "Car_Type": "סוג רכב",
-        "Is_Silent": "נסיעה שקטה",
-        "Max_Distance": "מרחק מקס'",
-        "Location_X": "מיקום X",
-        "Location_Y": "מיקום Y",
-        "Car_Type_Required": "סוג רכב נדרש",
-        "Is_Silent_Preference": "העדפת שקט",
-    }
-    # Also map variants with aliases in parentheses
-    mapped = {}
-    for k, v in base.items():
-        mapped[k] = v
-        mapped[f"{k} ({alias_rows})"] = f"{v} ({alias_rows})"
-        mapped[f"{k} ({alias_cols})"] = f"{v} ({alias_cols})"
-    return mapped
+def coverage_badge(assigned: int, total: int):
+    pct = 0 if total==0 else int(round(100*assigned/total))
+    cls = "ok" if assigned==total else "warn"
+    st.markdown(f'<span class="badge {cls}">כיסוי תקנים: {assigned}/{total} ({pct}%)</span>', unsafe_allow_html=True)
 
-def prettify_headers(df: pd.DataFrame, alias_rows: str, alias_cols: str) -> pd.DataFrame:
-    mapping = _hebrew_header_map(alias_rows, alias_cols)
-    cols = {c: mapping.get(c, c) for c in df.columns}
-    return df.rename(columns=cols)
+def is_required(day_code: str, shift_name: str, role: str) -> bool:
+    """Check per-day required; fallback to legacy global per-shift if not set."""
+    day_map = REQUIRED_BY_DAY.get(day_code, {})
+    if shift_name in day_map and role in day_map[shift_name]:
+        return bool(day_map[shift_name][role])
+    # Fallback to legacy per-shift default
+    return bool(REQUIRED_BY_SHIFT.get(shift_name, {}).get(role, False))
 
-def build_taxi_cost_matrix(df_drivers, df_passengers, weight_distance, weight_rating_match,
-                           hard_constraint, match_car_type, match_silent_pref) -> np.ndarray:
-    n_rows, n_cols = len(df_drivers), len(df_passengers)
-    base = np.zeros((n_rows, n_cols), dtype=float)
+# ----------------- Algorithm -----------------
+def build_rows_employee_days(df_emp: pd.DataFrame, active_days: List[str], max_override: Optional[int]) -> List[Tuple[str,str]]:
+    # Each row is (employee_id, day_code) up to cap
+    avail = {}
+    for _, r in df_emp.iterrows():
+        emp_id = str(r.get("ID"))
+        days = set(normalize_days_tokens(parse_csv_like(r.get("DaysAvailable",""))))
+        avail[emp_id] = [d for d in active_days if d in days]
+    rows = []
+    for _, r in df_emp.iterrows():
+        emp_id = str(r.get("ID"))
+        days_av = avail.get(emp_id, [])
+        if not days_av: continue
+        cap = None
+        if max_override and max_override > 0:
+            cap = int(max_override)
+        elif "MaxShiftsPerWeek" in df_emp.columns and pd.notna(r.get("MaxShiftsPerWeek")):
+            try: cap = int(r.get("MaxShiftsPerWeek"))
+            except: cap = None
+        if cap is None:
+            for d in days_av: rows.append((emp_id, d))
+        else:
+            # Greedy: top-demand days first
+            demand_sorted = st.session_state.get("DEMAND_SORT", active_days)
+            ordered = [d for d in demand_sorted if d in days_av]
+            for d in ordered[:cap]:
+                rows.append((emp_id, d))
+    return rows
 
-    dvec = vectorized_distance_cost(df_drivers, df_passengers)
-    if dvec is not None:
-        base += dvec * float(weight_distance)
-    else:
-        for i, driver in df_drivers.iterrows():
-            for j, passenger in df_passengers.iterrows():
-                cost = 0.0
-                try:
-                    if {"Location_X", "Location_Y"} <= set(driver.index) and {"Location_X", "Location_Y"} <= set(passenger.index):
-                        if pd.notna(driver["Location_X"]) and pd.notna(driver["Location_Y"]) and \
-                           pd.notna(passenger["Location_X"]) and pd.notna(passenger["Location_Y"]):
-                            dist = float(np.sqrt((driver["Location_X"] - passenger["Location_X"])**2 +
-                                                 (driver["Location_Y"] - passenger["Location_Y"])**2))
-                            cost += dist * float(weight_distance)
-                except Exception:
-                    pass
-                base[i, j] = cost
+def build_cols_from_weekplan(active_days: List[str]) -> List[Tuple[str,str,int,str]]:
+    """Columns = demand slots (day, shift, k, role). Quantity respects per-day required (min-1)."""
+    cols = []
+    for d in active_days:
+        plan = effective_plan_for_day(d)
+        for s, comp in plan.items():
+            for r in ROLES:
+                qty = int(comp.get(r, 0))
+                # Enforce per-day min-1 required roles
+                if is_required(d, s, r):
+                    qty = max(1, qty)
+                for k in range(1, qty+1):
+                    cols.append((d, s, k, r))
+    return cols
 
-    if "Rating" in df_drivers.columns and "Rating" in df_passengers.columns:
-        for i, driver in df_drivers.iterrows():
-            for j, passenger in df_passengers.iterrows():
-                if pd.notna(driver.get("Rating")) and pd.notna(passenger.get("Rating")):
-                    base[i, j] += abs(float(driver["Rating"]) - float(passenger["Rating"])) * float(weight_rating_match)
+def build_base_costs(rows, cols, df_emp, shift_hours: float):
+    # Pre-index employees
+    emp_index = {}
+    for _, r in df_emp.iterrows():
+        roles_q = set(parse_csv_like(r.get("RolesQualified","")))
+        # Fallback single Role if provided and non-empty
+        role_val = str(r.get("Role","")).strip()
+        if not roles_q and role_val:
+            roles_q = {role_val}
+        emp_index[str(r.get("ID"))] = {
+            "Name": r.get("Name",""),
+            "HourlyCost": float(r.get("HourlyCost",0.0) or 0.0),
+            "ShiftTypesAvailable": set(parse_csv_like(r.get("ShiftTypesAvailable",""))),
+            "RolesQualified": roles_q,
+        }
+    n_rows, n_cols = len(rows), len(cols)
+    M0 = np.full((n_rows, n_cols), HARD_BLOCK, dtype=float)
+    for i, (emp, d) in enumerate(rows):
+        e = emp_index.get(emp)
+        if e is None: continue
+        stypes = e["ShiftTypesAvailable"]
+        rolesq = e["RolesQualified"]
+        for j, (dj, s, _k, r) in enumerate(cols):
+            if dj != d: continue
+            if stypes and (s not in stypes): continue
+            if rolesq and (r not in rolesq): continue
+            M0[i,j] = e["HourlyCost"] * float(shift_hours)
+    return M0, emp_index
 
-    # Use a harsher block than dummy padding so algorithm prefers dummy for illegal pairs
-    HARD_BLOCK = float(hard_constraint) * 10.0
-
-    for i, driver in df_drivers.iterrows():
-        for j, passenger in df_passengers.iterrows():
-            if match_car_type and "Car_Type_Required" in df_passengers.columns and "Car_Type" in df_drivers.columns:
-                req = passenger.get("Car_Type_Required")
-                drt = driver.get("Car_Type")
-                if pd.notna(req) and pd.notna(drt) and req != drt:
-                    base[i, j] = base[i, j] + HARD_BLOCK
-            if match_silent_pref and "Is_Silent_Preference" in df_passengers.columns and "Is_Silent" in df_drivers.columns:
-                pref = passenger.get("Is_Silent_Preference")
-                drv_silent = driver.get("Is_Silent")
-                if pd.notna(pref) and bool(pref) and not bool(drv_silent):
-                    base[i, j] = base[i, j] + HARD_BLOCK
-            if "Max_Distance" in df_drivers.columns and dvec is not None:
-                if pd.notna(driver.get("Max_Distance")) and dvec[i, j] > float(driver["Max_Distance"]):
-                    base[i, j] = base[i, j] + HARD_BLOCK
-    return base
-
-def safe_compare(a, b, comp: str) -> Optional[bool]:
-    if pd.isna(a) or pd.isna(b):
-        return None
-    try:
-        if comp == "שווה (==)":
-            return a == b
-        if comp == "לא שווה (!=)":
-            return a != b
-        if comp == "קטן מ (<)":
-            return a < b
-        if comp == "גדול מ (>)":
-            return a > b
-    except Exception:
-        return None
-    return None
-
-def build_custom_cost_matrix(df_a, df_b, rules: List[Dict], penalty_mode: str) -> Optional[np.ndarray]:
-    if df_a.empty or df_b.empty:
-        return None
-    n_rows, n_cols = len(df_a), len(df_b)
-    M = np.zeros((n_rows, n_cols), dtype=float)
-    cols_a = set(df_a.columns); cols_b = set(df_b.columns)
-    for i, row in df_a.iterrows():
-        for j, col in df_b.iterrows():
-            cost = 0.0
-            for rule in rules:
-                col_a = rule.get("col_a"); col_b = rule.get("col_b")
-                comp = rule.get("comp"); penalty = float(rule.get("penalty", 0.0))
-                if col_a not in cols_a or col_b not in cols_b:
-                    continue
-                res = safe_compare(row.get(col_a), col.get(col_b), comp)
-                if penalty_mode == "כשלא מתקיים":
-                    if not res: cost += penalty
-                else:
-                    if res: cost += penalty
-            M[i, j] = cost
-    return M
-
-def _rename_with_aliases(df_assign: pd.DataFrame, row_label: str, col_label: str,
-                         keep_rows: List[str], keep_cols: List[str],
-                         alias_rows: str, alias_cols: str) -> pd.DataFrame:
-    dup = set(keep_rows) & set(keep_cols)
-    ren = {"ID_A": f"מזהה {alias_rows}".strip(),
-           "ID_B": f"מזהה {alias_cols}".strip()}
-    for c in keep_rows:
-        key = f"A_{c}"
-        val = f"{c} ({alias_rows})" if c in dup else c
-        ren[key] = val
-    for c in keep_cols:
-        key = f"B_{c}"
-        val = f"{c} ({alias_cols})" if c in dup else c
-        ren[key] = val
-    return df_assign.rename(columns=ren)
-
-def solve_assignment_problem(row_ids, col_ids, cost_matrix_base: np.ndarray, row_label: str, col_label: str,
-                             df_rows=None, df_cols=None, display_cols_rows=None, display_cols_cols=None,
-                             alias_rows: str = "A", alias_cols: str = "B",
-                             hard_constraint: float = DEFAULT_HARD_CONSTRAINT):
-    start = time.perf_counter()
-    n_rows, n_cols = cost_matrix_base.shape
+def solve_hungarian(M: np.ndarray):
+    n_rows, n_cols = M.shape
     dim = max(n_rows, n_cols)
-    padded = np.full((dim, dim), float(hard_constraint), dtype=float)
-    padded[:n_rows, :n_cols] = cost_matrix_base
-    row_ind, col_ind = linear_sum_assignment(padded)
-    run_time = time.perf_counter() - start
+    padded = np.full((dim, dim), HARD_CONSTRAINT, dtype=float)
+    padded[:n_rows, :n_cols] = M
+    r_idx, c_idx = linear_sum_assignment(padded)
+    return r_idx, c_idx
 
-    assignments = []; unassigned_records = []
-    for r, c in zip(row_ind, col_ind):
-        is_dummy_row = (r >= n_rows); is_dummy_col = (c >= n_cols)
-        cost_val = padded[r, c]
-        if not is_dummy_row and not is_dummy_col and cost_val < hard_constraint:
-            assignments.append({row_label: row_ids[r], col_label: col_ids[c], "עלות": float(cost_val)})
-        else:
-            # Unassigned cases: matched to dummy OR illegal real-real with big cost
-            if not is_dummy_row:
-                unassigned_records.append({
-                    "צד": row_label, "ID": row_ids[r],
-                    "סיבה": f"לא נמצא {alias_cols} מתאים"
-                })
-            if not is_dummy_col:
-                unassigned_records.append({
-                    "צד": col_label, "ID": col_ids[c],
-                    "סיבה": f"לא נמצא {alias_rows} מתאים"
-                })
+def iterative_fair_assignment(rows, cols, M0, fairness: str):
+    # penalties: total-load, per-shift, per-role + jitter
+    if fairness == "ללא חלוקה הוגנת":
+        iters, lam_total, lam_shift, lam_role, lam_run = 1, 0.0, 0.0, 0.0, 0.0
+    elif fairness == "חלוקה הוגנת (מתונה)":
+        iters, lam_total, lam_shift, lam_role, lam_run = 3, 1.0, 0.0, 0.2, 1.6
+    else:
+        iters, lam_total, lam_shift, lam_role, lam_run = 5, 2.0, 0.0, 0.3, 3.0
 
-    df_assign = pd.DataFrame(assignments)
-    total_cost = float(df_assign["עלות"].sum()) if not df_assign.empty else 0.0
-    df_unassigned = pd.DataFrame(unassigned_records)
+    n_rows, n_cols = M0.shape
+    valid = M0[M0 < HARD_BLOCK]
+    base_scale = float(np.median(valid)) if valid.size else 100.0
+    row_emp = [emp for emp,_ in rows]
+    col_shift = [s for (_d,s,_k,_r) in cols]
+    col_role  = [r for (_d,_s,_k,r) in cols]
 
-    # Enrich display for assignments
-    if df_rows is not None and df_cols is not None:
-        keep_rows = [c for c in (display_cols_rows or []) if c in df_rows.columns]
-        keep_cols = [c for c in (display_cols_cols or []) if c in df_cols.columns]
-        if keep_rows or keep_cols:
-            tmp = df_assign.rename(columns={row_label: "ID_A", col_label: "ID_B"})
-            if keep_rows:
-                left = df_rows.set_index("ID")[keep_rows].add_prefix("A_")
-                tmp = tmp.merge(left, left_on="ID_A", right_index=True, how="left")
-            if keep_cols:
-                right = df_cols.set_index("ID")[keep_cols].add_prefix("B_")
-                tmp = tmp.merge(right, left_on="ID_B", right_index=True, how="left")
-            ordered = ["ID_A"] + [f"A_{c}" for c in keep_rows] + ["ID_B"] + [f"B_{c}" for c in keep_cols] + ["עלות"]
-            df_assign = tmp[ordered]
-            df_assign = _rename_with_aliases(df_assign, row_label, col_label, keep_rows, keep_cols, alias_rows, alias_cols)
-        else:
-            df_assign = df_assign.rename(columns={row_label: f"מזהה {alias_rows}", col_label: f"מזהה {alias_cols}"})
+    rng = np.random.default_rng(42)
+    M = M0.copy()
+    assign = []
+    total_true = 0.0; total_pen = 0.0
 
-    # Build detailed unassigned tables (safe when none exist)
-    df_un_rows = pd.DataFrame(columns=["מי לא שובץ?", f"מזהה {alias_rows}", "סיבה"])
-    df_un_cols = pd.DataFrame(columns=["מי לא שובץ?", f"מזהה {alias_cols}", "סיבה"])
-    if not df_unassigned.empty and "צד" in df_unassigned.columns:
-        mask_r = df_unassigned["צד"] == row_label
-        if mask_r.any():
-            df_un_rows = df_unassigned.loc[mask_r, ["ID", "סיבה"]].copy()
-            df_un_rows.rename(columns={"ID": f"מזהה {alias_rows}"}, inplace=True)
-            df_un_rows.insert(0, "מי לא שובץ?", f"{alias_rows}")
-            extra_cols = [c for c in (display_cols_rows or []) if (df_rows is not None and c in df_rows.columns)]
-            if extra_cols:
-                df_un_rows = df_un_rows.merge(df_rows.set_index("ID")[extra_cols],
-                                              left_on=f"מזהה {alias_rows}", right_index=True, how="left")
-        mask_c = df_unassigned["צד"] == col_label
-        if mask_c.any():
-            df_un_cols = df_unassigned.loc[mask_c, ["ID", "סיבה"]].copy()
-            df_un_cols.rename(columns={"ID": f"מזהה {alias_cols}"}, inplace=True)
-            df_un_cols.insert(0, "מי לא שובץ?", f"{alias_cols}")
-            extra_cols = [c for c in (display_cols_cols or []) if (df_cols is not None and c in df_cols.columns)]
-            if extra_cols:
-                df_un_cols = df_un_cols.merge(df_cols.set_index("ID")[extra_cols],
-                                              left_on=f"מזהה {alias_cols}", right_index=True, how="left")
+    for t in range(1, iters+1):
+        jitter = rng.normal(0.0, 1e-6, size=M.shape)
+        r_idx, c_idx = solve_hungarian(M + jitter)
+        assign = []
+        used_rows, used_cols = set(), set()
+        for r,c in zip(r_idx, c_idx):
+            if r<n_rows and c<n_cols and M[r,c] < HARD_BLOCK:
+                assign.append((r,c)); used_rows.add(r); used_cols.add(c)
+        if t == iters:
+            total_true = float(np.sum([M0[r,c] for r,c in assign if M0[r,c] < HARD_BLOCK]))
+            total_pen  = float(np.sum([M[r,c]  for r,c in assign if M[r,c]  < HARD_BLOCK]))
+        if t < iters and (lam_total>0 or lam_shift>0 or lam_role>0 or lam_run>0):
+            cnt_total, cnt_shift, cnt_role = {}, {}, {}
+            for r,c in assign:
+                e = row_emp[r]
+                cnt_total[e] = cnt_total.get(e,0)+1
+                s = col_shift[c]; cnt_shift[(e,s)] = cnt_shift.get((e,s),0)+1
+                ro = col_role[c]; cnt_role[(e,ro)] = cnt_role.get((e,ro),0)+1
+            M = M0.copy()
+            for i,(emp,_day) in enumerate(rows):
+                ct = cnt_total.get(emp,0)
+                for j in range(n_cols):
+                    if M0[i,j] >= HARD_BLOCK: continue
+                    s = col_shift[j]; ro = col_role[j]
+                    cs = cnt_shift.get((emp,s),0)
+                    cr = cnt_role.get((emp,ro),0)
+                    pen = lam_total*base_scale*ct + lam_shift*base_scale*cs + lam_role*base_scale*cr
+                    M[i,j] = M0[i,j] + pen
+    
+            # --- Run/streak penalty: discourage same shift on consecutive days for the same employee ---
+            if lam_run > 0:
+                day_to_idx = {c:i for i,(c,_) in enumerate(DAYS_ORDER)}
+                per_emp = {}
+                for (ri, ci) in assign:
+                    dcode, sname, _k, _role = cols[ci]
+                    emp_id = row_emp[ri]
+                    per_emp.setdefault(emp_id, []).append((day_to_idx.get(dcode,0), sname, ri, ci))
+                for emp_id, items in per_emp.items():
+                    items.sort(key=lambda x: x[0])
+                    prev_shift = None
+                    for (_di, sname, ri, ci) in items:
+                        if prev_shift is not None and sname == prev_shift:
+                            if M[ri, ci] < HARD_BLOCK:
+                                M[ri, ci] = M[ri, ci] + lam_run * base_scale
+                        prev_shift = sname
+            # --- end run penalty ---
+    return assign, total_true, total_pen
 
-    return df_assign.sort_values(by="עלות", ascending=True), total_cost, run_time, df_un_rows, df_un_cols
+def cap_violations_report(df_assign: pd.DataFrame, df_emp: pd.DataFrame, max_override: Optional[int]):
+    if df_assign is None or df_assign.empty:
+        return pd.DataFrame(columns=["ID עובד","שם עובד","מגבלת מקס","מס' שיבוצים","חריגה?"])
+    caps = {}
+    for _, r in df_emp.iterrows():
+        emp_id = str(r.get("ID"))
+        cap = None
+        if max_override is not None and max_override > 0:
+            cap = int(max_override)
+        elif "MaxShiftsPerWeek" in df_emp.columns and pd.notna(r.get("MaxShiftsPerWeek")):
+            try: cap = int(r.get("MaxShiftsPerWeek"))
+            except: cap = None
+        caps[emp_id] = cap
+    counts = df_assign.groupby(["ID עובד","שם עובד"]).size().reset_index(name="מס' שיבוצים")
+    out = []
+    for _, rr in counts.iterrows():
+        emp_id = str(rr["ID עובד"]); name = rr["שם עובד"]; c = int(rr["מס' שיבוצים"])
+        cap = caps.get(emp_id, None)
+        status = "—" if cap is None else ("כן" if c > cap else "לא")
+        out.append({"ID עובד": emp_id, "שם עובד": name, "מגבלת מקס": cap if cap is not None else "לא מוגדר", "מס' שיבוצים": c, "חריגה?": status})
+    return pd.DataFrame(out)
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="Hungarian Assignment App", layout="wide")
-st.markdown("""
-<style>
-html, body, [data-testid="stAppViewContainer"] * { direction: rtl; text-align: right; }
-[data-testid="stSidebar"] * { direction: rtl; text-align: right; }
-/* Make table headers render LTR text correctly as needed */
-[data-testid="stDataFrame"] thead, [data-testid="stDataFrame"] th { unicode-bidi: plaintext; }
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🧭 מערכת שיבוץ — האלגוריתם ההונגרי")
-st.caption("גמיש, רספונסיבי, ונוח לדו\"ח.")
-
-with st.sidebar:
-    st.header("ℹ️ על האלגוריתם ההונגרי")
-    st.write("• האלגוריתם ההונגרי פותר בעיית התאמה מינימלית בגרף דו־חלקי באמצעות חיפוש התאמה מיטבית במטריצת עלויות.")
-    st.write("• הסיבוכיות בזמן היא סדר גודל O(n³); לכן ב־Benchmark נראה עקומה קובייתית בקירוב.")
-    st.write("• כאשר המטריצה אינה ריבועית, מרפדים ב'דמי' ו/או מוסיפים ענישה גדולה כדי לחסום שיבוצים לא חוקיים.")
-    st.divider()
-    HARD_CONSTRAINT = st.number_input("ענישה עבור אילוץ קשיח (גבוה=חוסם)",
-                                      min_value=1_000.0, max_value=100_000_000.0,
-                                      value=DEFAULT_HARD_CONSTRAINT, step=1_000.0, format="%.0f")
-
-tab_taxi, tab_custom, tab_bench = st.tabs(["🚕 שיבוץ נהגים לנוסעים", "🧩 שיבוץ מותאם אישית", "⏱️ מבחן ביצועים"])
-
-# ------- Taxi -------
-with tab_taxi:
-    st.subheader("🚕 שיבוץ נהגים לנוסעים")
-    st.markdown("**מבנה גיליונות נדרש**")
-    c1, c2 = st.columns(2)
+# ----------------- Settings Tab -----------------
+with tabs[0]:
+    st.subheader("הגדרות כלליות")
+    c1,c2,c3 = st.columns([1,1,1])
     with c1:
-        st.markdown("**Drivers**")
-        st.code("ID, Location_X, Location_Y, Rating, Car_Type, Is_Silent, Max_Distance", language="text")
+        CONFIG["shift_hours"] = st.number_input("⌛ אורך משמרת (שעות)", min_value=1.0, max_value=16.0, value=float(CONFIG.get("shift_hours",8.0)), step=0.5, format="%.1f")
     with c2:
-        st.markdown("**Passengers**")
-        st.code("ID, Location_X, Location_Y, Rating, Car_Type_Required, Is_Silent_Preference", language="text")
+        CONFIG["fairness"] = st.radio("חלוקה הוגנת", ["ללא חלוקה הוגנת","חלוקה הוגנת (מתונה)","חלוקה הוגנת (חזקה)"],
+                                      index={"ללא חלוקה הוגנת":0,"חלוקה הוגנת (מתונה)":1,"חלוקה הוגנת (חזקה)":2}.get(CONFIG.get("fairness","ללא חלוקה הוגנת"),0), horizontal=True)
+    with c3:
+        mv = CONFIG.get("max_override", 0)
+        CONFIG["max_override"] = st.number_input("מקס' משמרות לעובד (גלובלי, 0=ללא)", min_value=0, value=int(mv or 0), step=1)
+        if CONFIG["max_override"] == 0: CONFIG["max_override"] = None
 
-    uploaded = st.file_uploader("בחר קובץ Excel עם הגיליונות: Drivers, Passengers", type=["xlsx"], key="taxi_xlsx")
-
-    if uploaded:
-        try:
-            xbytes = uploaded.getvalue()
-            df_drivers = load_excel_sheet_from_bytes(xbytes, "Drivers")
-            df_passengers = load_excel_sheet_from_bytes(xbytes, "Passengers")
-
-            if df_drivers.empty or df_passengers.empty:
-                st.error("❌ הגיליונות חייבים להכיל נתונים.")
-            elif "ID" not in df_drivers.columns or "ID" not in df_passengers.columns:
-                st.error("❌ בכל גיליון חייבת להיות עמודת 'ID'.")
+    st.markdown("---")
+    st.markdown("#### 1) הגדרת תפקידים ומשמרות")
+    c_role, c_shift = st.columns(2)
+    with c_role:
+        st.markdown("##### תפקידים")
+        new_role = st.text_input("➕ תפקיד חדש", key="add_role_input")
+        if st.button("הוסף תפקיד", key="add_role_btn"):
+            name = (new_role or "").strip()
+            if name and name not in ROLES:
+                ROLES.append(name); st.success(f"נוסף תפקיד: {name}"); st.rerun()
             else:
-                with st.expander("בחר עמודות להצגה בתוצאות (אופציונלי)"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        disp_dr = st.multiselect("עמודות מ-Drivers", [c for c in df_drivers.columns if c != "ID"])
-                    with c2:
-                        disp_ps = st.multiselect("עמודות מ-Passengers", [c for c in df_passengers.columns if c != "ID"])
+                st.warning("שם ריק או קיים.")
+        if ROLES:
+            st.write("---")
+            for r in list(ROLES):
+                cA,cB = st.columns([8,1])
+                cA.markdown(f"<div class='chipline'>{r}</div>", unsafe_allow_html=True)
+                if cB.button("✖", key=f"del_role_{r}"):
+                    ROLES.remove(r)
+                    for s in list(REQUIRED_BY_SHIFT.keys()):
+                        REQUIRED_BY_SHIFT[s].pop(r, None)
+                    for d in list(REQUIRED_BY_DAY.keys()):
+                        for s in list(REQUIRED_BY_DAY[d].keys()):
+                            REQUIRED_BY_DAY[d][s].pop(r, None)
+                    for s in list(DEFAULT_STAFFING.keys()):
+                        DEFAULT_STAFFING[s].pop(r, None)
+                    for d in WEEK_PLAN.keys():
+                        for s in list(WEEK_PLAN[d].keys()):
+                            WEEK_PLAN[d][s].pop(r, None)
+                    st.rerun()
+        else:
+            st.caption("טרם הוגדרו תפקידים.")
 
-                st.markdown("#### משקולות ואילוצים")
-                with st.form("taxi_form"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        weight_distance = st.number_input("משקל למרחק", min_value=0.0, value=5.0)
-                    with c2:
-                        weight_rating_match = st.number_input("משקל לפער דירוגים", min_value=0.0, value=5.0)
-
-                    cc1, cc2 = st.columns(2)
-                    with cc1:
-                        match_car_type = st.checkbox("דרישת סוג רכב (אם קיימת)", value=False)
-                    with cc2:
-                        match_silent_pref = st.checkbox("העדפת נסיעה שקטה", value=False)
-
-                    submitted = st.form_submit_button("הרץ שיבוץ")
-
-                if submitted:
-                    with st.spinner("בונה מטריצת עלויות ומחשב שיבוץ..."):
-                        rows = df_drivers["ID"].tolist()
-                        cols = df_passengers["ID"].tolist()
-                        base = build_taxi_cost_matrix(df_drivers, df_passengers,
-                                                      weight_distance, weight_rating_match,
-                                                      HARD_CONSTRAINT, match_car_type, match_silent_pref)
-                        df_res, total_cost, runtime, df_un_drivers, df_un_passengers = solve_assignment_problem(
-                            rows, cols, base, "נהג", "נוסע",
-                            df_rows=df_drivers, df_cols=df_passengers,
-                            display_cols_rows=disp_dr, display_cols_cols=disp_ps,
-                            alias_rows="נהג", alias_cols="נוסע",
-                            hard_constraint=HARD_CONSTRAINT
-                        )
-                    st.session_state.taxi_output = {
-                        "df_res": df_res, "total_cost": total_cost, "runtime": runtime,
-                        "df_un_drivers": df_un_drivers, "df_un_passengers": df_un_passengers
-                    }
-
-                if "taxi_output" in st.session_state:
-                    out = st.session_state.taxi_output
-                    df_show = prettify_headers(out["df_res"], "נהג", "נוסע")
-                    st.success(f"💵 עלות כוללת: {out['total_cost']:.2f} | ⏱️ זמן ריצה: {out['runtime']:.4f} שניות")
-                    st.dataframe(df_show, use_container_width=True, hide_index=True)
-                    if not df_show.empty:
-                        st.download_button("⬇️ הורד תוצאות שיבוץ (CSV)",
-                                           data=to_csv_bytes(df_show),
-                                           file_name="assignments_taxi.csv", mime="text/csv")
-                    if out.get("df_un_drivers") is not None and not out["df_un_drivers"].empty:
-                        st.warning("🚫 נהגים שלא שובצו")
-                        st.dataframe(prettify_headers(out["df_un_drivers"], "נהג", "נוסע"), use_container_width=True, hide_index=True)
-                        st.download_button("⬇️ הורד 'נהגים שלא שובצו' (CSV)",
-                                           data=to_csv_bytes(prettify_headers(out["df_un_drivers"], "נהג", "נוסע")),
-                                           file_name="unassigned_drivers.csv", mime="text/csv")
-                    if out.get("df_un_passengers") is not None and not out["df_un_passengers"].empty:
-                        st.warning("🚫 נוסעים שלא שובצו")
-                        st.dataframe(prettify_headers(out["df_un_passengers"], "נהג", "נוסע"), use_container_width=True, hide_index=True)
-                        st.download_button("⬇️ הורד 'נוסעים שלא שובצו' (CSV)",
-                                           data=to_csv_bytes(prettify_headers(out["df_un_passengers"], "נהג", "נוסע")),
-                                           file_name="unassigned_passengers.csv", mime="text/csv")
-        except Exception as e:
-            st.error(f"❌ שגיאה: {e}")
-
-# ------- Custom -------
-with tab_custom:
-    st.subheader("🧩 שיבוץ מותאם אישית")
-    st.markdown("**מבנה גיליונות מומלץ:** Items_A ו-Items_B חייב להכיל 'ID'. יתר העמודות — לפי הכללים שתגדיר (למשל 'התמחות', 'ניסיון', 'מחיר').")
-
-    uploaded2 = st.file_uploader("בחר קובץ Excel עם הגיליונות: Items_A, Items_B", type=["xlsx"], key="custom_xlsx")
-
-    if uploaded2:
-        try:
-            xbytes2 = uploaded2.getvalue()
-            df_a = load_excel_sheet_from_bytes(xbytes2, "Items_A")
-            df_b = load_excel_sheet_from_bytes(xbytes2, "Items_B")
-
-            if df_a.empty or df_b.empty:
-                st.error("❌ הגיליונות חייבים להכיל נתונים.")
-            elif "ID" not in df_a.columns or "ID" not in df_b.columns:
-                st.error("❌ בכל גיליון חייבת להיות עמודת 'ID'.")
+    with c_shift:
+        st.markdown("##### משמרות")
+        new_shift = st.text_input("➕ משמרת חדשה", key="add_shift_input")
+        if st.button("הוסף משמרת", key="add_shift_btn"):
+            name = (new_shift or "").strip()
+            if name and name not in SHIFTS:
+                SHIFTS.append(name)
+                REQUIRED_BY_SHIFT.setdefault(name, {})
+                DEFAULT_STAFFING.setdefault(name, {})
+                st.session_state["NEW_SHIFT_ADDED"] = name
+                st.success(f"נוספה משמרת: {name}"); st.rerun()
             else:
-                alias_cols = st.columns(2)
-                with alias_cols[0]:
-                    alias_a = st.text_input("שם ישות A (לכותרות)", value="מרצה")
-                with alias_cols[1]:
-                    alias_b = st.text_input("שם ישות B (לכותרות)", value="קורס")
+                st.warning("שם ריק או קיים.")
 
-                with st.expander("בחר עמודות להצגה בתוצאות (אופציונלי)"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        disp_a = st.multiselect(f"עמודות מ-Items_A ({alias_a})", [c for c in df_a.columns if c != "ID"], key="disp_a")
-                    with c2:
-                        disp_b = st.multiselect(f"עמודות מ-Items_B ({alias_b})", [c for c in df_b.columns if c != "ID"], key="disp_b")
-
-                if "rules" not in st.session_state:
-                    st.session_state.rules = []
-
-                with st.form("add_rule"):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        col_a = st.selectbox("עמודה מ-Items_A", [c for c in df_a.columns if c != "ID"])
-                    with c2:
-                        col_b = st.selectbox("עמודה מ-Items_B", [c for c in df_b.columns if c != "ID"])
-                    comp = st.selectbox("סוג השוואה", ["שווה (==)", "לא שווה (!=)", "קטן מ (<)", "גדול מ (>)"])
-                    penalty = st.number_input("ערך ענישה", min_value=0.0, value=1000.0, step=100.0)
-                    c3, c4 = st.columns(2)
-                    with c3:
-                        penalty_mode = st.selectbox("מתי להעניש?", ["כשלא מתקיים", "כשמתקיים"])
-                    with c4:
-                        add_btn = st.form_submit_button("➕ הוסף כלל")
-                if add_btn:
-                    st.session_state.rules.append({"col_a": col_a, "col_b": col_b, "comp": comp, "penalty": penalty, "mode": penalty_mode})
+        # New feature: set default staffing for a newly added shift
+        if st.session_state.get("NEW_SHIFT_ADDED") and ROLES:
+            shift_to_set = st.session_state["NEW_SHIFT_ADDED"]
+            st.markdown(f"**הגדר ברירת מחדל לצוות עבור '{shift_to_set}':**")
+            with st.form(key="default_staffing_form"):
+                current_defaults = DEFAULT_STAFFING.get(shift_to_set, {})
+                cols = st.columns(max(1, len(ROLES)))
+                for r, col in zip(ROLES, cols):
+                    with col:
+                        v = int(current_defaults.get(r, 0))
+                        current_defaults[r] = int(st.number_input(f"כמות ל{r}", min_value=0, value=v, step=1, key=f"default_{shift_to_set}_{r}"))
+                if st.form_submit_button("שמור ברירת מחדל"):
+                    DEFAULT_STAFFING[shift_to_set] = current_defaults
+                    st.success("ברירת המחדל נשמרה.")
+                    st.session_state["NEW_SHIFT_ADDED"] = None
                     st.rerun()
 
-                if st.session_state.rules:
-                    st.markdown("##### איך נבנית מטריצת העלויות כאן?")
-                    st.markdown("- אין 'עלות בסיס'. כל כלל מוסיף קנס בהתאם לתוצאה (לפי בחירתך: כשמתקיים/כשלא מתקיים).")
-                    st.markdown("- כך אפשר לבטא אילוצים קשיחים (קנס גדול מאוד) או רכים (קנס קטן).")
-                    st.markdown(f"- לדוגמה: אם **התמחות {alias_a} ≠ התמחות {alias_b}** → הוסף 1e6 (חוסם). אם **ניסיון {alias_a} < נדרש** → הוסף 500.")
+        if SHIFTS:
+            st.write("---")
+            for s in list(SHIFTS):
+                cA,cB = st.columns([8,1])
+                cA.markdown(f"<div class='chipline'>{s}</div>", unsafe_allow_html=True)
+                if cB.button("✖", key=f"del_shift_{s}"):
+                    SHIFTS.remove(s)
+                    REQUIRED_BY_SHIFT.pop(s, None)
+                    for d in REQUIRED_BY_DAY.keys(): REQUIRED_BY_DAY[d].pop(s, None)
+                    DEFAULT_STAFFING.pop(s, None)
+                    for d in WEEK_PLAN.keys(): WEEK_PLAN[d].pop(s, None)
+                    st.rerun()
+        else:
+            st.caption("טרם הוגדרו משמרות.")
 
-                    st.markdown("##### כללים שהוגדרו")
-                    for i, rule in enumerate(st.session_state.rules):
-                        st.write(f"**כלל {i+1}:** אם '{rule['col_a']}' ב-{alias_a} **{rule['comp']}** '{rule['col_b']}' ב-{alias_b} — הוסף {rule['penalty']}. (ענישה: {rule.get('mode','כשלא מתקיים')})")
-                        if st.button("מחק", key=f"del_rule_{i}"):
-                            st.session_state.rules.pop(i); st.rerun()
+    st.markdown("---")
+    
+    st.markdown("---")
+    st.markdown("#### ימי פעילות עסקיים")
+    # שמירת ימי פעילות (ברירת מחדל: ראשון–שישי)
+    default_biz = ["Sun","Mon","Tue","Wed","Thu","Fri"]
+    current_biz = st.session_state.get("CONFIG", {}).get("business_days", default_biz)
+    human = {c: h for c,h in DAYS_ORDER}
+    sel = st.multiselect("בחר ימי פעילות", options=[c for c,_ in DAYS_ORDER],
+                         default=current_biz, format_func=lambda c: human.get(c,c))
+    CONFIG["business_days"] = sel
+    st.markdown("#### 2) תכנית שבועית (מותאם-אישית לימים)")
+    if SHIFTS and ROLES:
+        day_he = st.selectbox("בחר יום", [heb for _,heb in DAYS_ORDER], key="day_select")
+        day_code = next(c for c,h in DAYS_ORDER if h==day_he)
+        WEEK_PLAN.setdefault(day_code, {})
+        REQUIRED_BY_DAY.setdefault(day_code, {})
 
-                st.divider()
-                if st.button("בנה מטריצת עלויות והרץ שיבוץ"):
-                    with st.spinner("בונה מטריצה ומחשב שיבוץ..."):
-                        rows = df_a["ID"].tolist(); cols = df_b["ID"].tolist()
-                        mode_final = st.session_state.rules[-1].get("mode", "כשלא מתקיים") if st.session_state.rules else "כשלא מתקיים"
-                        rules_clean = [{k: v for k, v in r.items() if k in ("col_a", "col_b", "comp", "penalty")} for r in st.session_state.rules]
-                        base = build_custom_cost_matrix(df_a, df_b, rules_clean, penalty_mode=mode_final)
-                        if base is None:
-                            st.error("לא ניתן לבנות מטריצה — בדוק את הנתונים.")
-                        else:
-                            df_res, total_cost, runtime, df_un_A, df_un_B = solve_assignment_problem(
-                                rows, cols, base, "A_ID", "B_ID",
-                                df_rows=df_a, df_cols=df_b,
-                                display_cols_rows=disp_a, display_cols_cols=disp_b,
-                                alias_rows=alias_a, alias_cols=alias_b,
-                                hard_constraint=HARD_CONSTRAINT
-                            )
-                    st.session_state.custom_output = {
-                        "df_res": df_res, "total_cost": total_cost, "runtime": runtime,
-                        "df_un_A": df_un_A, "df_un_B": df_un_B
-                    }
+        st.info("בחר משמרות פעילות ביום זה, קבע תקנים לכל תפקיד, וסמן 'חובה' לתפקידים שחייבים אדם אחד לפחות.")
 
-                if "custom_output" in st.session_state:
-                    out = st.session_state.custom_output
-                    st.success(f"💵 עלות כוללת: {out['total_cost']:.2f} | ⏱️ זמן ריצה: {out['runtime']:.4f} שניות")
-                    st.dataframe(out["df_res"], use_container_width=True, hide_index=True)
-                    if not out["df_res"].empty:
-                        st.download_button("⬇️ הורד תוצאות (CSV)",
-                                           data=to_csv_bytes(out["df_res"]), file_name="assignments_custom.csv", mime="text/csv")
+        active_for_day = st.multiselect(f"משמרות פעילות ב{day_he}", options=SHIFTS, default=list(WEEK_PLAN[day_code].keys()))
+        # purge deselected
+        for s in list(WEEK_PLAN[day_code].keys()):
+            if s not in active_for_day: WEEK_PLAN[day_code].pop(s, None)
 
-                    if out.get("df_un_A") is not None and not out["df_un_A"].empty:
-                        st.warning(f"🚫 פריטי {alias_a} שלא שובצו")
-                        st.dataframe(out["df_un_A"], use_container_width=True, hide_index=True)
-                        st.download_button(f"⬇️ הורד '{alias_a} שלא שובצו' (CSV)",
-                                           data=to_csv_bytes(out["df_un_A"]), file_name="unassigned_A.csv", mime="text/csv")
-                    if out.get("df_un_B") is not None and not out["df_un_B"].empty:
-                        st.warning(f"🚫 פריטי {alias_b} שלא שובצו")
-                        st.dataframe(out["df_un_B"], use_container_width=True, hide_index=True)
-                        st.download_button(f"⬇️ הורד '{alias_b} שלא שובצו' (CSV)",
-                                           data=to_csv_bytes(out["df_un_B"]), file_name="unassigned_B.csv", mime="text/csv")
+        for s in active_for_day:
+            st.markdown(f"##### {s}")
+            comp = WEEK_PLAN[day_code].setdefault(s, {})
+            req_roles_day = REQUIRED_BY_DAY[day_code].setdefault(s, {})
+            req_roles_global = REQUIRED_BY_SHIFT.get(s, {})
+
+            cols = st.columns(max(1, len(ROLES)))
+            for r, col in zip(ROLES, cols):
+                with col:
+                    # Use default staffing as initial value if no custom value exists
+                    default_val = DEFAULT_STAFFING.get(s, {}).get(r, 0)
+                    v = int(comp.get(r, default_val))
+
+                    # default checkbox value = per-day if set else global legacy
+                    default_req = bool(req_roles_day.get(r, req_roles_global.get(r, False)))
+                    is_req_new = st.checkbox(f"חובה {r}", value=default_req, key=f"req_{day_code}_{s}_{r}")
+                    req_roles_day[r] = is_req_new
+
+                    comp[r] = int(st.number_input(f"תקן ל{r}", min_value=0, value=v, step=1, key=f"{day_code}_{s}_{r}"))
+            REQUIRED_BY_DAY[day_code][s] = req_roles_day
+    else:
+        st.info("הגדר תחילה תפקידים ומשמרות כדי לקבוע תכנית שבועית.")
+
+    st.markdown("---")
+    st.markdown("#### 3) קובץ עובדים")
+    st.markdown("חובה גיליון **Employees**: ID, Name, HourlyCost, DaysAvailable[, ShiftTypesAvailable][, RolesQualified][, Role][, MaxShiftsPerWeek]")
+    # הורדת תבנית לפני ההעלאה
+    try:
+        with open("Templet_Assighment.xlsx", "rb") as f:
+            tmpl_bytes = f.read()
+        st.download_button("⬇️ הורד תבנית אקסל", data=tmpl_bytes,
+                           file_name="Templet_Assighment.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except FileNotFoundError:
+        st.warning("קובץ התבנית Templet_Assighment.xlsx לא נמצא בתיקייה לצד קובץ ה־PY.")
+    up = st.file_uploader("בחר Excel", type=["xlsx"], key="emp_xlsx_roles")
+    if up is not None:
+        try:
+            EMP_BYTES = up.getvalue()
+            st.session_state["EMP_FILE_BYTES"] = EMP_BYTES
+            df_prev = read_excel_sheet(EMP_BYTES, "Employees")
+            ok, errs = validate_employees_df(df_prev)
+            if not ok:
+                for e in errs: st.error(f"❌ {e}")
+            # Preview (trimmed) regardless, if loaded
+            prev = []
+            head_df = df_prev.head(20)
+            for _, r in head_df.iterrows():
+                roles_q = ",".join(parse_csv_like(r.get("RolesQualified",""))) or (str(r.get("Role","")).strip())
+                prev.append({
+                    "ID": r.get("ID"), "שם": r.get("Name"),
+                    "ימים": ",".join(parse_csv_like(r.get("DaysAvailable",""))),
+                    "משמרות": ",".join(parse_csv_like(r.get("ShiftTypesAvailable",""))),
+                    "תפקידים": roles_q,
+                    "מקס'": int(r.get("MaxShiftsPerWeek",0) or 0),
+                })
+            st.success("✅ קובץ עובדים נטען.")
+            st.dataframe(pd.DataFrame(prev), use_container_width=True, hide_index=True)
         except Exception as e:
-            st.error(f"❌ שגיאה: {e}")
+            st.error(f"❌ שגיאה בטעינת הקובץ: {e}")
 
-# ------- Benchmark -------
-with tab_bench:
-    st.subheader("⏱️ מבחן ביצועים (לעקומת סיבוכיות בדו\"ח)")
-    c1, c2 = st.columns(2)
-    with c1:
-        max_size = st.number_input("גודל מטריצה מקסימלי (N)", min_value=10, max_value=1500, value=200, step=10)
-    with c2:
-        num_runs = st.number_input("מספר הרצות לממוצע", min_value=1, value=5, step=1)
+    if st.button("💾 שמור הגדרות", key="save_settings_btn"):
+        st.session_state["CONFIG"] = CONFIG
+        st.success("נשמר. עבור ללשונית 'תוצאות' כדי להריץ.")
 
-    if st.button("הרץ מבחן ביצועים"):
-        with st.spinner("מריץ..."):
-            sizes = list(range(10, int(max_size) + 1, 10))
-            all_runs = []
-            avg_times = []
-            for n in sizes:
-                rt = []
-                for r in range(int(num_runs)):
-                    M = np.random.rand(n, n) * 100.0
-                    t0 = time.perf_counter()
-                    linear_sum_assignment(M)
-                    sec = time.perf_counter() - t0
-                    rt.append(sec); all_runs.append((n, r+1, sec))
-                avg_times.append(float(np.mean(rt)))
-            df_perf = pd.DataFrame({"N": sizes, "avg_sec": avg_times})
-            df_perf.rename(columns={
-                "N": "גודל מטריצה (N)",
-                "avg_sec": f"זמן ממוצע ({int(num_runs)} הרצות) [שניות]"
-            }, inplace=True)
+# ----------------- Core Runner -----------------
+def run_assignment():
+    cfg = st.session_state.get("CONFIG", CONFIG)
+    xbytes = st.session_state.get("EMP_FILE_BYTES", None)
+    if not xbytes:
+        st.session_state["RESULTS"] = {"error":"צריך לטעון קובץ עובדים."}
+        return
+    df_emp = read_excel_sheet(xbytes, "Employees")
+    ok, errs = validate_employees_df(df_emp)
+    if not ok:
+        st.session_state["RESULTS"] = {"error":"קובץ העובדים אינו תקין. תקן בלשונית הגדרות."}
+        return
 
-            st.success("✅ מבחן הביצועים הסתיים בהצלחה.")
-            fig = px.line(df_perf, x="גודל מטריצה (N)", y=df_perf.columns[1], markers=True)
-            fig.update_layout(title=dict(text="זמן ריצה של האלגוריתם ההונגרי כתלות בגודל המטריצה", x=0.5, xanchor="center"))
-            st.plotly_chart(fig, use_container_width=True)
+    # Active days are those with selected shifts
+    biz = st.session_state.get("CONFIG", {}).get("business_days", ["Sun","Mon","Tue","Wed","Thu","Fri"])
+    active_days = [c for c,_ in DAYS_ORDER if (c in biz) and effective_plan_for_day(c)]
+    if not active_days:
+        st.session_state["RESULTS"] = {"error":"לא הוגדרו משמרות פעילות בשום יום."}
+        return
 
-            df_raw = pd.DataFrame(all_runs, columns=["N", "הרצה", "שניות"])
-            agg = df_raw.groupby("N")["שניות"].agg(["mean", "min", "max", "std"]).reset_index()
-            agg["מספר הרצות"] = int(num_runs)
-            agg.rename(columns={"N": "גודל מטריצה (N)", "mean": "ממוצע (שניות)", "min": "מינימום (שניות)",
-                                "max": "מקסימום (שניות)", "std": "סטיית תקן (שניות)"}, inplace=True)
+    # demand by day (for cap ordering)
+    day_totals = {}
+    for d in active_days:
+        total = 0
+        for s, comp in effective_plan_for_day(d).items():
+            for r, qty in comp.items():
+                total += max(qty, 1) if is_required(d, s, r) else qty
+        day_totals[d] = total
+    st.session_state["DEMAND_SORT"] = sorted(active_days, key=lambda dd: day_totals.get(dd,0), reverse=True)
+    st.session_state["MAX_OVERRIDE"] = cfg.get("max_override", None)
 
-            st.markdown("#### נתוני מבחן הביצועים")
-            st.dataframe(agg, use_container_width=True, hide_index=True)
-            st.download_button("⬇️ הורד נתוני מבחן ביצועים (CSV)", data=to_csv_bytes(agg), file_name="benchmark.csv", mime="text/csv")
+    rows = build_rows_employee_days(df_emp, active_days, cfg.get("max_override", None))
+    cols = build_cols_from_weekplan(active_days)
 
-            with st.expander("ראה את כל ההרצות (Raw)"):
-                st.dataframe(df_raw, use_container_width=True, hide_index=True)
-                st.download_button("⬇️ הורד את כל ההרצות (CSV)", data=to_csv_bytes(df_raw), file_name="benchmark_raw.csv", mime="text/csv")
+    if len(rows) == 0:
+        st.session_state["RESULTS"] = {"error":"אין עובד-יום זמין בשום משמרת פעילה שהוגדרה."}
+        return
+    if len(cols) == 0:
+        st.session_state["RESULTS"] = {"error":"לא הוגדרו תקנים (כמויות עובדים) בשום משמרת פעילה."}
+        return
+
+    M0, emp_index = build_base_costs(rows, cols, df_emp, shift_hours=cfg.get("shift_hours",8.0))
+    assign, true_cost, pen_cost = iterative_fair_assignment(rows, cols, M0, cfg.get("fairness","ללא חלוקה הוגנת"))
+
+    # Build assignment DF and structures
+    recs, used_rows, used_cols = [], set(), set()
+    for r,c in assign:
+        if r<len(rows) and c<len(cols) and M0[r,c] < HARD_BLOCK:
+            emp, d = rows[r]
+            (dj, s, k, role) = cols[c]
+            recs.append({
+                "יום": next(h for c2,h in DAYS_ORDER if c2==dj),
+                "משמרת": s, "תפקיד": role, "תקן": k,
+                "ID עובד": emp, "שם עובד": emp_index[emp]["Name"],
+                "עלות אמת": round(float(M0[r,c]),2),
+            })
+            used_rows.add(r); used_cols.add(c)
+    df_assign = pd.DataFrame(recs)
+
+    # Build schedule for share
+    schedule = {(code,heb): {s: [] for s in SHIFTS} for code,heb in DAYS_ORDER}
+    for _, row in df_assign.iterrows():
+        day_he = row["יום"]; code = next(c for c,h in DAYS_ORDER if h==day_he)
+        schedule[(code,day_he)][row["משמרת"]].append((row["תפקיד"], row["שם עובד"]))
+
+    # Unfilled slots with reasons
+    df_unfilled_rows = []
+    for j,(d,s,k,role) in enumerate(cols):
+        if j in used_cols: continue
+        reason = "לא נמצא עובד מתאים"
+        # check potential candidates
+        candidates = 0
+        for _, e in df_emp.iterrows():
+            if d not in set(normalize_days_tokens(parse_csv_like(e.get("DaysAvailable","")))): continue
+            stypes = set(parse_csv_like(e.get("ShiftTypesAvailable","")))
+            if stypes and s not in stypes: continue
+            roles_q = set(parse_csv_like(e.get("RolesQualified","")))
+            role_val = str(e.get("Role","")).strip()
+            if not roles_q and role_val:
+                roles_q = {role_val}
+            if roles_q and role in roles_q:
+                candidates += 1
+        if candidates == 0:
+            reason = "אין מועמדים זמינים/כשירים"
+        else:
+            reason = "הגעת מועמדים למכסה/העדפת עלות-איזון"
+        df_unfilled_rows.append({"יום": next(h for c,h in DAYS_ORDER if c==d), "משמרת": s, "תפקיד": role, "סיבה": reason})
+    df_unfilled = pd.DataFrame(df_unfilled_rows)
+
+    # Unused employee-days with reasons
+    df_unused_rows = []
+    used_count = {}
+    for r in used_rows:
+        emp,_ = rows[r]; used_count[emp] = used_count.get(emp,0)+1
+    # cap map
+    cap_map = {}
+    for _, e in df_emp.iterrows():
+        emp_id = str(e.get("ID"))
+        cap = None
+        if cfg.get("max_override", None) is not None:
+            cap = int(cfg["max_override"])
+        elif "MaxShiftsPerWeek" in df_emp.columns and pd.notna(e.get("MaxShiftsPerWeek")):
+            try: cap = int(e.get("MaxShiftsPerWeek"))
+            except: cap=None
+        cap_map[emp_id] = cap
+    for i,(emp, d) in enumerate(rows):
+        if i in used_rows: continue
+        reason = "לא נדרש ביום זה"
+        if cap_map.get(emp) is not None and used_count.get(emp,0) >= cap_map[emp]:
+            reason = "הגיע למקסימום משמרות"
+        else:
+            # qualify any open slot?
+            qualify = False
+            row_e_all = df_emp[df_emp["ID"].astype(str)==emp]
+            if not row_e_all.empty:
+                row_e = row_e_all.iloc[0]
+                stypes = set(parse_csv_like(row_e.get("ShiftTypesAvailable","")))
+                roles_q = set(parse_csv_like(row_e.get("RolesQualified","")))
+                role_val = str(row_e.get("Role","")).strip()
+                if not roles_q and role_val:
+                    roles_q = {role_val}
+                for j,(dj,s,k,role) in enumerate(cols):
+                    if dj!=d or j in used_cols: continue
+                    if (not stypes or s in stypes) and (not roles_q or role in roles_q):
+                        qualify = True; break
+            reason = "נמצא מועמד מתאים יותר לפי עלות/איזון" if qualify else "אין התאמה למשמרות/תפקידים ביום זה"
+        df_unused_rows.append({"ID עובד": emp, "שם עובד": (row_e_all["Name"].iloc[0] if not row_e_all.empty else ""), "יום": next(h for c,h in DAYS_ORDER if c==d), "סיבה": reason})
+    df_unused = pd.DataFrame(df_unused_rows)
+
+    # Cap violations
+    cap_df = cap_violations_report(df_assign, df_emp, cfg.get("max_override", None)) if not df_assign.empty else pd.DataFrame()
+
+    # Share table with ' | ' and 'לא שובץ'
+    biz = st.session_state.get("CONFIG", {}).get("business_days", ["Sun","Mon","Tue","Wed","Thu","Fri"])
+    cols_order = [heb for code,heb in DAYS_ORDER if (code in biz) and effective_plan_for_day(code)]
+    # rows_order = union of all active shifts across the week, in user SHIFTS order
+    rows_order = SHIFTS
+
+    def build_cell(day_he, shift_name):
+        code = next(c for c,h in DAYS_ORDER if h==day_he)
+        items = schedule.get((code,day_he),{}).get(shift_name, [])
+        demand_map = effective_plan_for_day(code).get(shift_name, {})
+        parts = []
+        for r in ROLES:
+            if r in demand_map or is_required(code, shift_name, r):
+                names = [n for (rr,n) in items if rr==r]
+                # Respect min-1 for required; if no names show 'לא שובץ'
+                show_empty = (len(names) == 0) and (is_required(code, shift_name, r) or demand_map.get(r,0) > 0)
+                parts.append(f"{r}: {', '.join(names) if (names and not show_empty) else 'לא שובץ' if show_empty else ', '.join(names)}")
+        return " | ".join(parts)
+
+    data = []
+    for s in rows_order:
+        row_vals = []
+        for heb in cols_order:
+            code = next(c for c,h in DAYS_ORDER if h==heb)
+            row_vals.append(build_cell(heb, s))
+        data.append(row_vals)
+    df_share = pd.DataFrame(data, columns=cols_order, index=rows_order).reset_index().rename(columns={"index":"משמרות/יום"})
+    df_share = df_share[["משמרות/יום"] + [c for c in df_share.columns if c in cols_order]]
+
+    # Dispersion metrics
+    per_emp = df_assign.groupby("שם עובד").size().reset_index(name="מספר שיבוצים") if not df_assign.empty else pd.DataFrame(columns=["שם עובד","מספר שיבוצים"])
+    arr = per_emp["מספר שיבוצים"].values if not per_emp.empty else np.array([])
+    cv = float(np.std(arr)/np.mean(arr)) if arr.size>0 and np.mean(arr)>0 else 0.0
+    g = gini(arr) if arr.size>0 else 0.0
+    per_emp_chart_df = per_emp.set_index("שם עובד")[["מספר שיבוצים"]] if not per_emp.empty else pd.DataFrame()
+
+    # Costs
+    cost_by_day = df_assign.groupby("יום")["עלות אמת"].sum().reset_index().sort_values("יום") if not df_assign.empty else pd.DataFrame(columns=["יום","עלות אמת"])
+    cost_by_shift = df_assign.groupby("משמרת")["עלות אמת"].sum().reset_index().sort_values("משמרת") if not df_assign.empty else pd.DataFrame(columns=["משמרת","עלות אמת"])
+    cost_by_emp = df_assign.groupby("שם עובד")["עלות אמת"].sum().reset_index().sort_values("עלות אמת", ascending=False) if not df_assign.empty else pd.DataFrame(columns=["שם עובד","עלות אמת"])
+
+    st.session_state["RESULTS"] = {
+        "df_assign": df_assign,
+        "df_unfilled": df_unfilled,
+        "df_unused": df_unused,
+        "cap_df": cap_df,
+        "schedule": schedule,
+        "df_share": df_share,
+        "total_true_cost": float(true_cost),
+        "total_penalized_cost": float(pen_cost),
+        "assigned_slots": len(used_cols),
+        "total_slots": len(cols),
+        "cv": cv, "gini": g,
+        "per_emp_chart_df": per_emp_chart_df,
+        "cost_by_day": cost_by_day,
+        "cost_by_shift": cost_by_shift,
+        "cost_by_emp": cost_by_emp,
+    }
+
+# ----------------- Tabs -----------------
+with tabs[1]:
+    st.subheader("תוצאות — שיבוץ אופטימלי")
+    if st.button("🚀 הרץ שיבוץ", key="run_assignment_btn"):
+        run_assignment()
+    res = st.session_state.get("RESULTS")
+    if not res:
+        st.info("הגדר בלשונית 'הגדרות' ואז הרץ.")
+    elif "error" in res:
+        st.error(res["error"])
+    else:
+        coverage_badge(res["assigned_slots"], res["total_slots"])
+        st.success(f"💵 עלות כוללת (אמת): {round(res['total_true_cost'],2)}")
+        if CONFIG.get("fairness") != "ללא חלוקה הוגנת":
+            st.caption(f"עלות עם חלוקה הוגנת (קריטריון): {round(res['total_penalized_cost'],2)}")
+
+        # --- Detailed assignments at the top ---
+        st.subheader("שיבוצים מפורטים")
+        st.dataframe(res["df_assign"].sort_values(by=["יום","משמרת","תפקיד","תקן"]), use_container_width=True, hide_index=True)
+        st.download_button("⬇️ הורד תוצאות (CSV)", data=res["df_assign"].to_csv(index=False).encode("utf-8-sig"),
+                           file_name="shift_assignments.csv", mime="text/csv")
+
+        st.markdown("---")
+        # --- Three cost tables side-by-side ---
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            st.markdown("#### עלות לפי יום")
+            st.dataframe(res["cost_by_day"], use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("#### עלות לפי משמרת")
+            st.dataframe(res["cost_by_shift"], use_container_width=True, hide_index=True)
+        with c3:
+            st.markdown("#### עלות שבועית לפי עובד")
+            st.dataframe(res["cost_by_emp"], use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        # --- Dispersion metrics at bottom ---
+        st.subheader("מדדי פיזור")
+        c1,c2 = st.columns(2)
+        c1.metric("CV", f"{res['cv']:.3f}")
+        c2.metric("Gini", f"{res['gini']:.3f}")
+        if res["per_emp_chart_df"] is not None and not res["per_emp_chart_df"].empty:
+            st.bar_chart(res["per_emp_chart_df"], use_container_width=True)
+with tabs[2]:
+    st.subheader("לא שובצו — ניתוח סיבות")
+    res = st.session_state.get("RESULTS")
+    if not res or "error" in (res or {}):
+        st.info("אין נתונים להצגה. הרץ בלשונית תוצאות.")
+    else:
+        c1,c2 = st.columns(2)
+        with c1:
+            st.markdown("#### עובדים-יום שלא שובצו + סיבה")
+            df_unused = res["df_unused"]
+            if df_unused is None or df_unused.empty:
+                st.success("כל העובדים-יום שובצו או לא נדרשו.")
+            else:
+                biz = st.session_state.get("CONFIG", {}).get("business_days", ["Sun","Mon","Tue","Wed","Thu","Fri"])
+                active_heb = [heb for code,heb in DAYS_ORDER if (code in biz) and effective_plan_for_day(code)]
+                if df_unused is not None and not df_unused.empty and "יום" in df_unused.columns:
+                    df_unused = df_unused[df_unused["יום"].isin(active_heb)]
+                st.dataframe(df_unused.sort_values(by=["שם עובד","יום"]), use_container_width=True, hide_index=True)
+                st.download_button("⬇️ הורד (CSV)", data=df_unused.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="unused_employee_days.csv", mime="text/csv")
+        with c2:
+            st.markdown("#### תקנים שלא התמלאו + סיבה")
+            df_unfilled = res["df_unfilled"]
+            if df_unfilled is None or df_unfilled.empty:
+                st.success("כל התקנים מולאו.")
+            else:
+                biz = st.session_state.get("CONFIG", {}).get("business_days", ["Sun","Mon","Tue","Wed","Thu","Fri"])
+                active_heb = [heb for code,heb in DAYS_ORDER if (code in biz) and effective_plan_for_day(code)]
+                if "יום" in df_unfilled.columns:
+                    df_unfilled = df_unfilled[df_unfilled["יום"].isin(active_heb)]
+                st.dataframe(df_unfilled.sort_values(by=["יום","משמרת","תפקיד"]), use_container_width=True, hide_index=True)
+                st.download_button("⬇️ הורד (CSV)", data=df_unfilled.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="unfilled_slots.csv", mime="text/csv")
+
+with tabs[3]:
+    st.subheader("דשבורד בקרה")
+    res = st.session_state.get("RESULTS")
+    if not res or "error" in res:
+        st.info("הרץ שיבוץ להצגת דוחות.")
+    else:
+        # Preflight audit — demand vs potential supply
+        xbytes = st.session_state.get("EMP_FILE_BYTES")
+        if xbytes:
+            df_emp = read_excel_sheet(xbytes, "Employees")
+            rows = []
+            biz = st.session_state.get("CONFIG", {}).get("business_days", ["Sun","Mon","Tue","Wed","Thu","Fri"])
+            for code, heb in [(c,h) for (c,h) in DAYS_ORDER if (c in biz) and effective_plan_for_day(c)]:
+                plan = effective_plan_for_day(code)
+                for s, comp in plan.items():
+                    for r in ROLES:
+                        need = int(comp.get(r, 0))
+                        if is_required(code, s, r): need = max(1, need)
+                        if need > 0:
+                            raw = 0
+                            for _, e in df_emp.iterrows():
+                                if code not in set(normalize_days_tokens(parse_csv_like(e.get("DaysAvailable","")))): continue
+                                stypes = set(parse_csv_like(e.get("ShiftTypesAvailable","")))
+                                if stypes and s not in stypes: continue
+                                roles_q = set(parse_csv_like(e.get("RolesQualified","")))
+                                role_val = str(e.get("Role","")).strip()
+                                if not roles_q and role_val:
+                                    roles_q = {role_val}
+                                if roles_q and r in roles_q:
+                                    raw += 1
+                            rows.append({"יום": heb, "משמרת": s, "תפקיד": r, "נדרש": int(need), "היצע פוטנציאלי": raw})
+            df_audit = pd.DataFrame(rows)
+            st.markdown("#### בדיקת היתכנות (ביקוש מול היצע)")
+            if df_audit.empty:
+                st.info("אין נתונים להצגה.")
+            else:
+                st.dataframe(df_audit.sort_values(by=["יום","משמרת","תפקיד"]), use_container_width=True, hide_index=True)
+                totals = df_audit[["נדרש","היצע פוטנציאלי"]].sum()
+                st.bar_chart(totals, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### חריגות ממגבלת משמרות")
+        cap_df = res.get("cap_df", pd.DataFrame())
+        st.dataframe(cap_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### מדדי הוגנות (פיזור)")
+        c1,c2 = st.columns(2)
+        c1.metric("CV", f"{res['cv']:.3f}")
+        c2.metric("Gini", f"{res['gini']:.3f}")
+        if res.get("per_emp_chart_df") is not None and not res["per_emp_chart_df"].empty:
+            st.bar_chart(res["per_emp_chart_df"], use_container_width=True)
+
+with tabs[4]:
+    st.subheader("טבלת שיתוף לעובדים (להדפסה/שילוח)")
+    res = st.session_state.get("RESULTS")
+    if not res or "error" in (res or {}):
+        st.info("הרץ שיבוץ בלשונית 'תוצאות' כדי לבנות טבלה.")
+    else:
+        st.dataframe(res["df_share"], use_container_width=True, hide_index=True)
+        csv = res["df_share"].to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ הורד CSV", data=csv, file_name="shareable_schedule.csv", mime="text/csv")
+        xbytes = io.BytesIO()
+        with pd.ExcelWriter(xbytes, engine="openpyxl") as writer:
+            res["df_share"].to_excel(writer, index=False, sheet_name="Schedule")
+        st.download_button("⬇️ הורד XLSX", data=xbytes.getvalue(),
+                           file_name="shareable_schedule.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.markdown("---")
+st.caption("פיזור הוגן חזק פועל בכפוף לזמינות/כשירות. כדי לראות ערבוב טוב יותר — הגדל כשירות/זמינות, איזן דרישות, או העלה מגבלת מקס'.")
+# --- Added: Effective plan resolver (custom overrides defaults) ---
+def effective_plan_for_day(day_code: str) -> Dict[str, Dict[str,int]]:
+    """
+    Return the plan for a given day:
+    - If a custom plan exists in WEEK_PLAN, use it.
+    - Else, derive from DEFAULT_STAFFING; activate a shift if it has demand (>0)
+      or any role is globally required for that shift.
+    """
+    custom = WEEK_PLAN.get(day_code, {}) if 'WEEK_PLAN' in globals() else {}
+    if custom:
+        return custom
+
+    eff: Dict[str, Dict[str,int]] = {}
+    for s in SHIFTS:
+        base = DEFAULT_STAFFING.get(s, {}) if 'DEFAULT_STAFFING' in globals() else {}
+        if not isinstance(base, dict):
+            continue
+        has_demand = any(int(base.get(r, 0)) > 0 for r in ROLES)
+        has_required = any(bool(REQUIRED_BY_SHIFT.get(s, {}).get(r, False)) for r in ROLES) if 'REQUIRED_BY_SHIFT' in globals() else False
+        if has_demand or has_required:
+            eff[s] = {r: int(base.get(r, 0)) for r in ROLES}
+    return eff
+# --- End Added ---
