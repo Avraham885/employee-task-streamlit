@@ -11,7 +11,7 @@ Changes:
 5) Share/print table respects required min staffing display ('לא שובץ' when empty).
 6) General hardening and small UX copy edits.
 """
-
+st.set_page_config(page_title="שיבוץ משמרות לבתי קפה ומסעדות")
 
 # ---- Hotfix guard: ensure effective_plan_for_day exists before any call ----
 try:
@@ -927,3 +927,4 @@ def effective_plan_for_day(day_code: str) -> Dict[str, Dict[str,int]]:
             eff[s] = {r: int(base.get(r, 0)) for r in ROLES}
     return eff
 # --- End Added ---
+
