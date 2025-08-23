@@ -11,7 +11,6 @@ Changes:
 5) Share/print table respects required min staffing display ('לא שובץ' when empty).
 6) General hardening and small UX copy edits.
 """
-st.set_page_config(page_title="שיבוץ משמרות לבתי קפה ומסעדות")
 
 # ---- Hotfix guard: ensure effective_plan_for_day exists before any call ----
 try:
@@ -64,6 +63,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy.optimize import linear_sum_assignment
+
+st.set_page_config(page_title="שיבוץ משמרות לבתי קפה ומסעדות")
 
 # ----------------- Constants & Layout -----------------
 HARD_CONSTRAINT = 1_000_000.0
@@ -927,4 +928,5 @@ def effective_plan_for_day(day_code: str) -> Dict[str, Dict[str,int]]:
             eff[s] = {r: int(base.get(r, 0)) for r in ROLES}
     return eff
 # --- End Added ---
+
 
